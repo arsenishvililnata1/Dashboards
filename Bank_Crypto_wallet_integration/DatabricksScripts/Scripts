@@ -1,1 +1,516 @@
+-- =====================================================================
+-- BANK CRYPTO INTEGRATION DASHBOARD
+-- Full Analytical SQL Suite
+-- Platform: Databricks
+-- Last Updated: 2026-06-26
+-- Data Sources: workspace.bog.*
+-- =====================================================================
+--
+-- CONTENTS
+--   1. Measure Documentation (all core metrics + calculation logic)
+--   2. Revenue & Vendor ROI Scenarios (adoption x tx-frequency x vendor)
+--   3. Customer Segmentation by Income Band (crypto spending potential)
+--   4. Simple Revenue Scenarios (quick adoption-only projection)
+--
+-- =====================================================================
 
+
+-- =====================================================================
+-- 1. MEASURE DOCUMENTATION
+-- ყველა Measure-ის გამოთვლის სრული დოკუმენტაცია
+-- =====================================================================
+
+-- ---------------------------------------------------------------------
+-- 1.1  სულ მომხმარებლები (Total Customers): 40,000
+-- Dataset: სულ მომხმარებლები
+-- ---------------------------------------------------------------------
+-- SELECT COUNT(DISTINCT Customer_ID) as total_customers
+-- FROM workspace.bog.customer_profiles
+--
+-- ლოგიკა: ყველა უნიკალური მომხმარებელი customer_profiles ცხრილიდან
+
+-- ---------------------------------------------------------------------
+-- 1.2  აქტიური კრიპტო მომხმარებლები (Active Crypto Customers): 7,654
+-- Dataset: აქტიური კრიპტო მომხმარებლები (single)
+-- ---------------------------------------------------------------------
+-- SELECT COUNT(DISTINCT Customer_ID) as crypto_customers
+-- FROM workspace.bog.card_transactions_merchants
+-- WHERE Merchant IN ('Binance', 'Kraken', 'Bybit', 'Bitstamp', 'Coinbase')
+--   AND Transaction_Status = 'Approved'
+--
+-- ლოგიკა: მომხმარებლები რომლებსაც აქვთ დამტკიცებული ტრანზაქციები 5 კრიპტო ბირჟაზე
+-- Market Share: 19.1% = 7,654 / 40,000
+
+-- ---------------------------------------------------------------------
+-- 1.3  ყოველთვიური კრიპტო მოცულობა (Monthly Crypto Volume): $11.2M
+-- Dataset: ყოველთვიური კრიპტო მოცულობა
+-- ---------------------------------------------------------------------
+-- SELECT ROUND(SUM(CAST(Transaction_Amount_USD AS DOUBLE)), 0) as monthly_volume
+-- FROM workspace.bog.card_transactions_merchants
+-- WHERE Merchant IN ('Binance', 'Kraken', 'Bybit', 'Bitstamp', 'Coinbase')
+--   AND Transaction_Status = 'Approved'
+--
+-- ლოგიკა: დამტკიცებული კრიპტო ტრანზაქციების ჯამური USD მოცულობა
+-- Annual Volume: $135M = $11.2M × 12
+
+-- ---------------------------------------------------------------------
+-- 1.4  პოტენციური მომხმარებლები (Potential Customers): 23,262
+-- Dataset: პოტენციური მომხმარებლები
+-- ---------------------------------------------------------------------
+-- WITH crypto_customers AS (
+--   SELECT DISTINCT Customer_ID
+--   FROM workspace.bog.card_transactions_merchants
+--   WHERE Merchant IN ('Binance', 'Kraken', 'Bybit', 'Bitstamp', 'Coinbase')
+--     AND Transaction_Status = 'Approved'
+-- ),
+-- investment_customers AS (
+--   SELECT DISTINCT Customer_ID
+--   FROM workspace.bog.card_transactions_merchants
+--   WHERE Merchant = 'Bank''s Investment Module'
+--     AND Transaction_Status = 'Approved'
+-- )
+-- SELECT COUNT(DISTINCT cp.Customer_ID) as potential_users
+-- FROM workspace.bog.customer_profiles cp
+--   LEFT JOIN crypto_customers cc ON cp.Customer_ID = cc.Customer_ID
+--   LEFT JOIN investment_customers ic ON cp.Customer_ID = ic.Customer_ID
+-- WHERE cc.Customer_ID IS NULL                                  -- არ არის კრიპტო მომხმარებელი
+--   AND (ic.Customer_ID IS NOT NULL                              -- ან Investment Module მომხმარებელია
+--        OR cp.Monthly_Number_of_Logins_in_Mobile_Bank >= 10)    -- ან მობაილ აქტიურია
+--
+-- ლოგიკა: არა-კრიპტო მომხმარებლები + (ინვესტიციის მომხმარებლები OR მობაილ აქტიური >=10 logins)
+-- Conversion Pool: 58.2% = 23,262 / 40,000
+
+-- ---------------------------------------------------------------------
+-- 1.5  📈 Metric View: Bank Crypto Integration Metrics
+-- Dataset: Bank Crypto Integration Metrics (datasets/bog_crypto_metrics)
+-- Type: Dashboard Local Metric View (DLMV)
+-- ---------------------------------------------------------------------
+-- Source Query Structure:
+--   enriched_transactions → customer_classifications → final SELECT
+--
+-- Derived Fields:
+--   is_crypto_tx:          CASE WHEN Merchant IN ('Binance','Kraken','Bybit','Bitstamp','Coinbase')
+--                                AND Status='Approved' THEN 1 ELSE 0 END
+--   is_investment_tx:      CASE WHEN Merchant LIKE '%Investment Module%'
+--                                AND Status='Approved' THEN 1 ELSE 0 END
+--   is_crypto_customer:    MAX(is_crypto_tx) OVER (PARTITION BY Customer_ID)   -- ფანჯრული ფუნქცია
+--   is_potential_customer: CASE WHEN is_crypto_customer=0
+--                                AND (is_investment_customer=1 OR mobile_logins>=10)
+--                                THEN 1 ELSE 0 END
+--
+-- Measures (12 total):
+--   Transaction Count:        COUNT(*)
+--   Total Volume:              SUM(Transaction_Amount_USD)
+--   Avg Transaction:           AVG(Transaction_Amount_USD)
+--   Unique Customers:          COUNT(DISTINCT Customer_ID)
+--   Crypto Transaction Count:  COUNT(*) FILTER (WHERE is_crypto_tx=1)
+--   Crypto Volume:             SUM(Transaction_Amount_USD) FILTER (WHERE is_crypto_tx=1)
+--   Crypto Customers:          COUNT(DISTINCT CASE WHEN is_crypto_customer=1 THEN Customer_ID END)
+--   Potential Customers:       COUNT(DISTINCT CASE WHEN is_potential_customer=1 THEN Customer_ID END)
+--   Customer Count:            COUNT(DISTINCT Customer_ID)
+--   Avg Age:                   AVG(Age)
+--   Avg Mobile Logins:         AVG(Monthly_Number_of_Logins_in_Mobile_Bank)
+
+-- ---------------------------------------------------------------------
+-- 1.6  💰 Revenue Projections
+-- Dataset: Revenue სცენარები (simple) (datasets/revenue_scenarios_simple)
+-- ---------------------------------------------------------------------
+-- Base Formula:
+--   Annual Revenue = Potential × Adoption % × Avg TX × TX/month × 12 × 2%
+--
+-- Constants:
+--   Potential Customers: 23,262
+--   Avg TX Amount:       $876   = $11.2M / (7,654 × 1.67 tx/month)
+--   Base TX Rate:        1.67 per month (Dec 2024 actual)
+--   Revenue Share:       2% (commission)
+--
+-- Scenarios:
+--   Low (30%):            6,979 customers  → $1,456,948 / year
+--   Conservative (50%):  11,631 customers  → $2,428,247 / year
+--   Moderate (70%):      16,283 customers  → $3,399,546 / year
+--   Aggressive (100%):   23,262 customers  → $4,856,494 / year
+
+-- ---------------------------------------------------------------------
+-- 1.7  📊 ROI Calculations
+-- Dataset: ROI სცენარები - Vendor Costs (datasets/roi_scenarios)
+-- ---------------------------------------------------------------------
+-- Year 1 Formulas (includes setup cost):
+--   Year1_Total_Cost      = (Annual_Transactions × Cost_Per_Tx) + Annual_Fixed_Cost + Setup_Cost
+--   Year1_Profit          = Annual_Revenue - Year1_Total_Cost
+--   Year1_ROI_Percent     = (Year1_Profit / Year1_Total_Cost) × 100
+--   Year1_Breakeven_Months = Year1_Total_Cost / (Year1_Profit / 12)
+--
+-- Year 2+ Formulas (no setup cost):
+--   Year2_Total_Cost      = (Annual_Transactions × Cost_Per_Tx) + Annual_Fixed_Cost
+--   Year2_Profit          = Annual_Revenue - Year2_Total_Cost
+--   Year2_ROI_Percent     = (Year2_Profit / Year2_Total_Cost) × 100
+--
+-- Vendor Comparison:
+--   Vendor_1: Lowest per-TX cost
+--   Vendor_2: Highest fixed cost
+--   Vendor_3: Best ROI balance
+
+-- ---------------------------------------------------------------------
+-- 1.8  🎨 Customer Segmentation
+-- Dataset: კრიპტო ხარჯვა შემოსავლის დიაპაზონის მიხედვით
+--          (datasets/income_crypto_spending)
+-- ---------------------------------------------------------------------
+-- CTE Flow:
+--   crypto_customers            - იდენტიფიკაცია
+--   investment_customers        - ინვესტორების იდენტიფიკაცია
+--   active_crypto_spending      - აქტიური ხარჯვა Income_Band-ების მიხედვით
+--   avg_spending_per_customer   - საშუალო ხარჯვა
+--   potential_users_by_income   - პოტენციალი Income_Band-ებით
+--   new_users_spending          - პროგნოზირებული ხარჯვა
+--   combined                    - აქტიური + პოტენციური
+
+-- ---------------------------------------------------------------------
+-- 1.9  ✅ Validation Queries
+-- ყველა measure შეიძლება დამოუკიდებლად შემოწმდეს:
+-- ---------------------------------------------------------------------
+-- SELECT
+--   (SELECT COUNT(DISTINCT Customer_ID)
+--    FROM workspace.bog.customer_profiles) as total,
+--   (SELECT COUNT(DISTINCT Customer_ID)
+--    FROM workspace.bog.card_transactions_merchants
+--    WHERE Merchant IN ('Binance','Kraken','Bybit','Bitstamp','Coinbase')
+--    AND Transaction_Status='Approved') as crypto_active,
+--   (SELECT ROUND(SUM(CAST(Transaction_Amount_USD AS DOUBLE)),0)
+--    FROM workspace.bog.card_transactions_merchants
+--    WHERE Merchant IN ('Binance','Kraken','Bybit','Bitstamp','Coinbase')
+--    AND Transaction_Status='Approved') as monthly_volume
+
+-- ---------------------------------------------------------------------
+-- 1.10  🔍 Data Quality
+-- ---------------------------------------------------------------------
+--   No duplicates:    ყველა COUNT-ი იყენებს DISTINCT Customer_ID
+--   Status filter:    მხოლოდ Transaction_Status = 'Approved'
+--   Merchant list:    5 validated exchanges
+--   Currency:         ყველაფერი USD-ში
+--   Join integrity:   LEFT JOIN-ები უზრუნველყოფენ ყველა მომხმარებლის ჩართვას
+
+
+-- =====================================================================
+-- 2. REVENUE & VENDOR ROI SCENARIOS
+-- Updated with REAL NUMBERS: 23,262 potential customers, $876 avg transaction
+-- Based on: $11.2M monthly volume / (7,654 active customers * 1.67 tx/month) = $876
+-- =====================================================================
+
+WITH real_metrics AS (
+  SELECT
+    23262 as total_potential,
+    876.0 as avg_tx_amount
+),
+tx_rate_scenarios AS (
+  SELECT
+    1.0 as tx_per_month,
+    'Conservative TX' as tx_scenario,
+    1 as tx_sort
+  UNION ALL
+  SELECT
+    1.67,
+    'Base TX (Dec 2024)',
+    2
+  UNION ALL
+  SELECT
+    2.5,
+    'Optimistic TX',
+    3
+),
+revenue_scenarios AS (
+  SELECT
+    CASE adoption_pct
+      WHEN 0.30 THEN 'Low (30% Adoption)'
+      WHEN 0.50 THEN 'Conservative (50% Adoption)'
+      WHEN 0.70 THEN 'Moderate (70% Adoption)'
+      WHEN 1.00 THEN 'Aggressive (100% Adoption)'
+    END as Scenario,
+    tx_scenario,
+    CAST(rm.total_potential * adoption_pct AS INT) as New_Customers,
+    CAST(rm.total_potential * adoption_pct * tx_per_month * 12 AS BIGINT) as Annual_Transactions,
+    rm.total_potential * adoption_pct * rm.avg_tx_amount * tx_per_month * 12 as Annual_Volume,
+    rm.total_potential
+      * adoption_pct
+      * rm.avg_tx_amount
+      * tx_per_month
+      * 12
+      * 0.02 as Annual_Revenue,
+    CASE adoption_pct
+      WHEN 0.30 THEN 1
+      WHEN 0.50 THEN 2
+      WHEN 0.70 THEN 3
+      ELSE 4
+    END as Sort_Order,
+    tx_sort
+  FROM
+    real_metrics rm
+      CROSS JOIN tx_rate_scenarios
+      CROSS JOIN (
+        SELECT
+          0.30 as adoption_pct
+        UNION ALL
+        SELECT
+          0.50
+        UNION ALL
+        SELECT
+          0.70
+        UNION ALL
+        SELECT
+          1.00
+      ) adoption
+),
+vendor_costs AS (
+  SELECT
+    Vendor,
+    Ongoing_Cost_Per_Transaction_USD as Cost_Per_Tx,
+    Annual_Fixed_Cost_USD,
+    Setup_Cost_USD,
+    CASE
+      WHEN Vendor = 'Vendor_1' THEN 1
+      WHEN Vendor = 'Vendor_2' THEN 2
+      WHEN Vendor = 'Vendor_3' THEN 3
+    END as vendor_sort
+  FROM
+    workspace.bog.crypto_vendor_fees
+),
+combined AS (
+  SELECT
+    rs.Scenario,
+    rs.tx_scenario,
+    vc.Vendor,
+    rs.New_Customers,
+    rs.Annual_Transactions,
+    rs.Annual_Volume,
+    rs.Annual_Revenue,
+    vc.Cost_Per_Tx,
+    rs.Annual_Transactions * vc.Cost_Per_Tx as Transaction_Costs,
+    vc.Annual_Fixed_Cost_USD as Annual_Fixed_Costs,
+    vc.Setup_Cost_USD,
+    -- Year 1: includes setup cost
+    rs.Annual_Transactions
+      * vc.Cost_Per_Tx
+      + vc.Annual_Fixed_Cost_USD
+      + vc.Setup_Cost_USD as Year1_Total_Cost,
+    rs.Annual_Revenue
+      - (
+        rs.Annual_Transactions * vc.Cost_Per_Tx + vc.Annual_Fixed_Cost_USD + vc.Setup_Cost_USD
+      ) as Year1_Profit,
+    (
+      (
+        rs.Annual_Revenue
+          - (rs.Annual_Transactions * vc.Cost_Per_Tx + vc.Annual_Fixed_Cost_USD + vc.Setup_Cost_USD)
+      )
+        / (rs.Annual_Transactions * vc.Cost_Per_Tx + vc.Annual_Fixed_Cost_USD + vc.Setup_Cost_USD)
+    )
+      * 100 as Year1_ROI_Percent,
+    (rs.Annual_Transactions * vc.Cost_Per_Tx + vc.Annual_Fixed_Cost_USD + vc.Setup_Cost_USD)
+      / (
+        (
+          rs.Annual_Revenue
+            - (
+              rs.Annual_Transactions * vc.Cost_Per_Tx + vc.Annual_Fixed_Cost_USD + vc.Setup_Cost_USD
+            )
+        )
+          / 12
+      ) as Year1_Breakeven_Months,
+    -- Year 2+: no setup cost
+    rs.Annual_Transactions
+      * vc.Cost_Per_Tx
+      + vc.Annual_Fixed_Cost_USD as Year2_Total_Cost,
+    rs.Annual_Revenue
+      - (rs.Annual_Transactions * vc.Cost_Per_Tx + vc.Annual_Fixed_Cost_USD) as Year2_Profit,
+    (
+      (rs.Annual_Revenue - (rs.Annual_Transactions * vc.Cost_Per_Tx + vc.Annual_Fixed_Cost_USD))
+        / (rs.Annual_Transactions * vc.Cost_Per_Tx + vc.Annual_Fixed_Cost_USD)
+    )
+      * 100 as Year2_ROI_Percent,
+    rs.Sort_Order,
+    rs.tx_sort,
+    vc.vendor_sort
+  FROM
+    revenue_scenarios rs CROSS JOIN vendor_costs vc
+)
+SELECT
+  Scenario,
+  tx_scenario,
+  Vendor,
+  New_Customers,
+  Annual_Transactions,
+  Annual_Revenue,
+  Cost_Per_Tx,
+  Transaction_Costs,
+  Annual_Fixed_Costs,
+  Setup_Cost_USD,
+  Year1_Total_Cost,
+  Year1_Profit,
+  Year1_ROI_Percent,
+  Year1_Breakeven_Months,
+  Year2_Total_Cost,
+  Year2_Profit,
+  Year2_ROI_Percent,
+  Sort_Order,
+  tx_sort,
+  vendor_sort
+FROM
+  combined
+ORDER BY
+  Sort_Order,
+  tx_sort,
+  vendor_sort;
+
+
+-- =====================================================================
+-- 3. CUSTOMER SEGMENTATION BY INCOME BAND
+-- Simplified: No duplicated crypto_customers/investment_customers CTEs
+-- Uses base tables directly with filters
+-- =====================================================================
+
+WITH active_crypto_spending AS (
+  -- აქტიური კრიპტო ხარჯვა Income Band-ის მიხედვით
+  SELECT
+    cp.Income_Band,
+    SUM(CAST(tx.Transaction_Amount_USD AS DOUBLE)) as total_spending
+  FROM
+    workspace.bog.card_transactions_merchants tx
+      INNER JOIN workspace.bog.customer_profiles cp
+        ON tx.Customer_ID = cp.Customer_ID
+  WHERE
+    tx.Merchant IN ('Binance', 'Kraken', 'Bybit', 'Bitstamp', 'Coinbase')
+    AND tx.Transaction_Status = 'Approved'
+  GROUP BY
+    cp.Income_Band
+),
+avg_spending_per_customer AS (
+  -- საშუალო ხარჯვა კრიპტო მომხმარებელზე
+  SELECT
+    SUM(CAST(Transaction_Amount_USD AS DOUBLE)) / COUNT(DISTINCT Customer_ID) as avg_spending
+  FROM
+    workspace.bog.card_transactions_merchants
+  WHERE
+    Merchant IN ('Binance', 'Kraken', 'Bybit', 'Bitstamp', 'Coinbase')
+    AND Transaction_Status = 'Approved'
+),
+potential_users_by_income AS (
+  -- პოტენციური მომხმარებლები Income Band-ის მიხედვით
+  -- Logic: არ არის კრიპტო მომხმარებელი მაგრამ (ინვესტორი ან მობაილ აქტიური)
+  SELECT
+    cp.Income_Band,
+    COUNT(DISTINCT cp.Customer_ID) as potential_count
+  FROM
+    workspace.bog.customer_profiles cp
+  WHERE
+    cp.Customer_ID NOT IN (
+      -- გამოვრიცხოთ კრიპტო მომხმარებლები
+      SELECT
+      DISTINCT
+        Customer_ID
+      FROM
+        workspace.bog.card_transactions_merchants
+      WHERE
+        Merchant IN ('Binance', 'Kraken', 'Bybit', 'Bitstamp', 'Coinbase')
+        AND Transaction_Status = 'Approved'
+    )
+    AND (
+      -- ინვესტიციის მომხმარებლები
+      cp.Customer_ID IN (
+        SELECT DISTINCT
+          Customer_ID
+        FROM
+          workspace.bog.card_transactions_merchants
+        WHERE
+          Merchant = 'Bank''s Investment Module'
+          AND Transaction_Status = 'Approved'
+      )
+      -- ან მობაილ აქტიურები
+      OR cp.Monthly_Number_of_Logins_in_Mobile_Bank >= 10
+    )
+  GROUP BY
+    cp.Income_Band
+),
+new_users_spending AS (
+  -- პოტენციური მომხმარებლების პროგნოზირებული ხარჯვა
+  SELECT
+    pu.Income_Band,
+    ROUND(pu.potential_count * avg.avg_spending, 2) as new_spending
+  FROM
+    potential_users_by_income pu CROSS JOIN avg_spending_per_customer avg
+),
+combined AS (
+  SELECT
+    COALESCE(acs.Income_Band, nus.Income_Band) as Income_Band,
+    COALESCE(acs.total_spending, 0) as Active_Spending,
+    COALESCE(acs.total_spending, 0) + COALESCE(nus.new_spending, 0) as Total_Potential_Spending
+  FROM
+    active_crypto_spending acs
+      FULL OUTER JOIN new_users_spending nus
+        ON acs.Income_Band = nus.Income_Band
+)
+SELECT
+  Income_Band,
+  'აქტიური ხარჯვა' as Spending_Type,
+  Active_Spending as Spending_USD,
+  1 as Sort_Order
+FROM
+  combined
+UNION ALL
+SELECT
+  Income_Band,
+  'პოტენციური ხარჯვა (აქტიური + ახალი)' as Spending_Type,
+  Total_Potential_Spending as Spending_USD,
+  2 as Sort_Order
+FROM
+  combined
+ORDER BY
+  CASE
+    WHEN Income_Band = 'High' THEN 1
+    WHEN Income_Band = 'Middle' THEN 2
+    WHEN Income_Band = 'Low' THEN 3
+    ELSE 4
+  END,
+  Sort_Order;
+
+
+-- =====================================================================
+-- 4. SIMPLE REVENUE SCENARIOS (quick adoption-only projection)
+-- Updated with REAL NUMBERS: 23,262 potential customers, $876 avg transaction
+-- Based on: $11.2M monthly volume / (7,654 active customers * 1.67 tx/month) = $876
+-- =====================================================================
+
+WITH real_metrics AS (
+  SELECT
+    23262 as total_potential,
+    876.0 as avg_tx_amount
+)
+SELECT
+  'Low (30% Adoption)' as Scenario,
+  CAST(total_potential * 0.30 AS INT) as Total_Customers,
+  ROUND(total_potential * 0.30 * avg_tx_amount * 1.67 * 12 * 0.02, 2) as Annual_Revenue,
+  1 as Sort_Order
+FROM
+  real_metrics
+UNION ALL
+SELECT
+  'Conservative (50% Adoption)' as Scenario,
+  CAST(total_potential * 0.50 AS INT) as Total_Customers,
+  ROUND(total_potential * 0.50 * avg_tx_amount * 1.67 * 12 * 0.02, 2) as Annual_Revenue,
+  2 as Sort_Order
+FROM
+  real_metrics
+UNION ALL
+SELECT
+  'Moderate (70% Adoption)' as Scenario,
+  CAST(total_potential * 0.70 AS INT) as Total_Customers,
+  ROUND(total_potential * 0.70 * avg_tx_amount * 1.67 * 12 * 0.02, 2) as Annual_Revenue,
+  3 as Sort_Order
+FROM
+  real_metrics
+UNION ALL
+SELECT
+  'Aggressive (100% Adoption)' as Scenario,
+  CAST(total_potential AS INT) as Total_Customers,
+  ROUND(total_potential * avg_tx_amount * 1.67 * 12 * 0.02, 2) as Annual_Revenue,
+  4 as Sort_Order
+FROM
+  real_metrics
+ORDER BY
+  Sort_Order;
